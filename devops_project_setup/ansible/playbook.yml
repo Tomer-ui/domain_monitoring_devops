@@ -1,27 +1,43 @@
 ---
-# PLAY 1: COMMON CONFIG
+# ==========================================
+# PLAY 1: COMMON CONFIGURATION
+# ==========================================
 - name: Configure Common Dependencies
   hosts: all
   become: yes
   tasks:
-    - name: Create Swap (4GB)
+    # 1. SWAP CONFIGURATION (Essential for stability)
+    - name: Create and Enable Swap (2GB)
       shell: |
-        if [ ! -f /swapfile ]; then
-          dd if=/dev/zero of=/swapfile bs=128M count=32
-          mkswap /swapfile
-          chmod 0600 /swapfile
-          swapon /swapfile
-        fi
+        swapoff /swapfile || true
+        dd if=/dev/zero of=/swapfile bs=128M count=16
+        chmod 0600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+        grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      register: swap_result
 
-    - name: Install Docker
+    # 2. DOCKER INSTALLATION
+    - name: Update Apt Cache
+      apt:
+        update_cache: yes
+
+    - name: Install Prerequisite Packages
+      apt:
+        name: [apt-transport-https, ca-certificates, curl, software-properties-common, python3-pip, unzip, openjdk-17-jre]
+        state: present
+
+    - name: Add Docker GPG Key and Repo
       shell: |
-        apt-get update
-        apt-get install -y apt-transport-https ca-certificates curl software-properties-common python3-pip
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
         add-apt-repository -y "deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable"
-        apt-get install -y docker-ce
 
-    - name: Install Python Docker SDK
+    - name: Install Docker & Python SDK
+      apt:
+        name: docker-ce
+        state: present
+    
+    - name: Install Python Docker Library
       pip:
         name: docker
         extra_args: "--break-system-packages"
@@ -29,7 +45,9 @@
     - name: Add ubuntu to docker group
       user: { name: ubuntu, groups: docker, append: yes }
 
+# ==========================================
 # PLAY 2: MASTER SETUP
+# ==========================================
 - name: Configure Jenkins Master
   hosts: master
   become: yes
@@ -44,36 +62,7 @@
         src: ./jcasc_configs/jenkins.yaml
         dest: /var/jenkins_home/casc_configs/jenkins.yaml
 
-    # FIX: Create plugins list manually to avoid line-ending issues
-    - name: Create Plugins List
-      copy:
-        dest: /var/jenkins_home/plugins.txt
-        mode: '0666'
-        content: |
-          configuration-as-code
-          git
-          job-dsl
-          workflow-aggregator
-          pipeline-stage-view
-          docker-plugin
-          docker-workflow
-          instance-identity
-
-    # FIX: Install Plugins using a temporary container (Saves RAM)
-    - name: Install Plugins (Offline Mode)
-      docker_container:
-        name: plugin-installer
-        image: jenkins/jenkins:lts-jdk17
-        state: started
-        user: root 
-        entrypoint: ["jenkins-plugin-cli", "-f", "/var/jenkins_home/plugins.txt", "-d", "/var/jenkins_home/plugins", "--verbose"]
-        volumes:
-          - /var/jenkins_home/plugins.txt:/var/jenkins_home/plugins.txt
-          - jenkins_data:/var/jenkins_home
-        detach: false
-        cleanup: yes
-
-    # START JENKINS (With Memory Limit)
+    # 1. Start Jenkins (Initial Boot)
     - name: Start Jenkins Master
       docker_container:
         name: jenkins-master
@@ -86,47 +75,93 @@
           - jenkins_data:/var/jenkins_home
         env:
           CASC_JENKINS_CONFIG: /var/jenkins_home/casc_configs/jenkins.yaml
-          JAVA_OPTS: "-Xmx512m -Djenkins.install.runSetupWizard=false"
+          JAVA_OPTS: "-Xmx384m -Djenkins.install.runSetupWizard=false"
           JENKINS_ADMIN_PASSWORD: "{{ my_jenkins_pass }}"
 
-    # WAIT LOGIC
-    - name: Wait for Jenkins Node to be Ready
-      uri:
-        url: "http://localhost:8080/computer/jenkins-node-1/api/json"
-        user: "admin"
-        password: "{{ my_jenkins_pass }}"
-        force_basic_auth: yes
-        status_code: 200
-      register: node_check
-      until: node_check.status == 200
-      retries: 60
-      delay: 10
-
-    # SECRET PARSING
-    - name: Fetch Secret
+    # 2. Install Plugins
+    - name: Install Jenkins Plugins
       shell: |
-        curl -L -s -u admin:{{ my_jenkins_pass }} "http://localhost:8080/computer/jenkins-node-1/jenkins-agent.jnlp" | \
-        grep -o '<argument>[^<]*</argument>' | head -n 1 | cut -d '>' -f 2 | cut -d '<' -f 1
-      register: secret_output
+        docker exec -u root jenkins-master \
+        jenkins-plugin-cli --plugins configuration-as-code git job-dsl workflow-aggregator pipeline-stage-view docker-plugin docker-workflow
+      register: plugin_result
+      changed_when: "'Downloaded' in plugin_result.stdout"
 
+    # 3. Fix Permissions & Restart
+    - name: Fix Jenkins Home Permissions
+      shell: docker exec -u root jenkins-master chown -R 1000:1000 /var/jenkins_home
+
+    - name: Restart Jenkins to apply plugins
+      docker_container:
+        name: jenkins-master
+        state: started
+        restart: yes
+
+    # 4. Optimized Waits
+    - name: Wait for Port 8080
+      wait_for:
+        port: 8080
+        delay: 2
+        timeout: 60
+
+    - name: Wait for Jenkins to be ready
+      uri:
+        url: "http://localhost:8080/login"
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 40   # Max 2 minutes
+      delay: 3      # Check every 3 seconds
+
+    # 5. Get Secret (Cookie Jar Method)
+    - name: Get Jenkins Node Secret
+      shell: |
+        CRUMB=$(curl -s 'http://localhost:8080/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,":",//crumb)' -u "admin:{{ my_jenkins_pass }}" -c /tmp/cookies)
+        
+        curl -s -X POST 'http://localhost:8080/scriptText' \
+             -u "admin:{{ my_jenkins_pass }}" \
+             -b /tmp/cookies \
+             -H "$CRUMB" \
+             --data-urlencode "script=println(jenkins.model.Jenkins.instance.getNode('jenkins-node-1')?.computer?.jnlpMac)"
+      register: secret_output
+      until: secret_output.stdout != "null" and secret_output.stdout != ""
+      retries: 20
+      delay: 3
+
+    - name: Print Secret
+      debug:
+        msg: "The secret is {{ secret_output.stdout }}"
+
+# ==========================================
 # PLAY 3: NODE SETUP
+# ==========================================
 - name: Configure Jenkins Node
   hosts: node
   become: yes
   vars:
-    master_ip: "{{ groups['master'][0] }}"
+    master_private_ip: "{{ hostvars[groups['master'][0]]['private_ip'] }}"
     node_secret: "{{ hostvars[groups['master'][0]]['secret_output']['stdout'] }}"
   
   tasks:
-    - name: Start Agent
+    - name: Ensure Workspace Directory Exists
+      file:
+        path: /home/jenkins
+        state: directory
+        owner: 1000
+        group: 1000
+        mode: '0755'
+
+    - name: Start Agent Container
       docker_container:
         name: jenkins-agent
         image: jenkins/inbound-agent:latest
         state: started
         restart_policy: always
-        volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+        volumes: 
+          - "/var/run/docker.sock:/var/run/docker.sock"
+          - "/home/jenkins:/home/jenkins"
+        user: root 
         env:
-          JENKINS_URL: "http://{{ master_ip }}:8080"
+          JENKINS_URL: "http://{{ master_private_ip }}:8080"
           JENKINS_AGENT_NAME: "jenkins-node-1"
           JENKINS_SECRET: "{{ node_secret }}"
           JENKINS_WORKDIR: "/home/jenkins"

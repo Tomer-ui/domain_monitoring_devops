@@ -2,6 +2,8 @@ jenkins:
   systemMessage: "Managed by JCasC and Ansible"
   numExecutors: 0
   mode: EXCLUSIVE
+  # This port must be open for the Node to connect via JNLP
+  slaveAgentPort: 50000
   securityRealm:
     local:
       allowsSignup: false
@@ -11,8 +13,9 @@ jenkins:
   authorizationStrategy:
     loggedInUsersCanDoAnything:
       allowAnonymousRead: true
-  agentProtocols:
-  - "JNLP4-connect"
+  
+  # Note: 'agentProtocols' has been removed as it causes crashes in modern Jenkins versions.
+  
   nodes:
   - permanent:
       labelString: "Slave"
@@ -35,7 +38,7 @@ jobs:
           cpsScm {
             scm {
               git {
-                remote { url('https://github.com/MatanItzhaki12/domain_monitoring_devops.git') }
+                remote { url('https://github.com/Tomer-ui/domain_monitoring_devops.git') }
                 branch('main')
               }
             }
